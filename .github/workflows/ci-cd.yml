@@ -211,8 +211,6 @@ jobs:
       - name: Configure Maven repo for JFrog deploy
         run: |
           jf mvnc \
-            --repo-resolve-releases=${{ env.JFROG_REPO }} \
-            --repo-resolve-snapshots=${{ env.JFROG_REPO }} \
             --repo-deploy-releases=${{ env.JFROG_REPO }} \
             --repo-deploy-snapshots=${{ env.JFROG_REPO }}
 

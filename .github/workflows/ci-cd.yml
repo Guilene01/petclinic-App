@@ -81,8 +81,8 @@ jobs:
   # ---------------------------------------------------------------
   # 3. SonarCloud Static Analysis
   # ---------------------------------------------------------------
-  sonarcloud:
-    name: SonarCloud Scan
+  sonarQube-scan:
+    name: SonarQube-Scan
     runs-on: ubuntu-latest
     needs: test
     steps:
@@ -105,23 +105,32 @@ jobs:
           key: ${{ runner.os }}-sonar
           restore-keys: ${{ runner.os }}-sonar
 
-      - name: Build, test, and analyze with SonarCloud
+      - name: SonarQube code analysis
+        uses: SonarSource/sonarqube-scan-action@v4
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: >
-          mvn -B verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar
-          -Dsonar.projectKey=${{ env.SONAR_PROJECT_KEY }}
-          -Dsonar.organization=${{ env.SONAR_ORGANIZATION }}
-          -Dsonar.host.url=https://sonarcloud.io
-          -Dsonar.token=${{ env.SONAR_TOKEN }}
-
+          SONAR_TOKEN: ${{ env.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ env.SONAR_PROJECT_KEY }}
+            -Dsonar.organization=${{ env.SONAR_ORGANIZATION }}
+      - name: SonarCloud Quality Gate Check
+        id: quality-gate
+        uses: phwt/sonarqube-quality-gate-action@v1
+        with:
+          sonar-project-key: ${{ env.SONAR_PROJECT_KEY }}
+          sonar-host-url: https://sonarcloud.io
+          sonar-token: ${{ env.SONAR_TOKEN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          branch: main
+          fail-on-error: true
   # ---------------------------------------------------------------
   # 4. Trivy Vulnerability Scan (filesystem / dependencies)
   # ---------------------------------------------------------------
   trivy-scan:
     name: Trivy Security Scan
     runs-on: ubuntu-latest
-    needs: sonarcloud
+    needs: sonarQube-scan
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -166,7 +175,7 @@ jobs:
   publish:
     name: Publish to JFrog Artifactory
     runs-on: ubuntu-latest
-    needs: [ sonarcloud, trivy-scan ]
+    needs: [ sonarQube-scan, trivy-scan ]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     steps:
       - name: Checkout code

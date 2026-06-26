@@ -117,6 +117,7 @@ jobs:
           args: >
             -Dsonar.projectKey=${{ env.SONAR_PROJECT_KEY }}
             -Dsonar.organization=${{ env.SONAR_ORGANIZATION }}
+            -Dsonar.java.binaries=target/classes
       - name: SonarCloud Quality Gate Check
         id: quality-gate
         uses: phwt/sonarqube-quality-gate-action@v1

@@ -208,3 +208,221 @@ jobs:
 
       - name: Upload JAR to Artifactory
         run: jf rt upload "target/*.jar" ${{ env.JFROG_REPO }}/
+
+  # ---------------------------------------------------------------
+  # 6. Smoke Test – launch EC2, deploy JAR, run Playwright UI tests
+  #
+  # Required secrets / vars:
+  #   AWS_ROLE_ARN   – IAM role ARN for OIDC assumption (no static keys needed)
+  #                    Trust policy must allow:
+  #                      Principal: { Federated: "arn:aws:iam::<ACCT>:oidc-provider/token.actions.githubusercontent.com" }
+  #                      Condition:  StringEquals: { "token.actions.githubusercontent.com:sub": "repo:<org>/<repo>:ref:refs/heads/main" }
+  #   AWS_REGION     – e.g. us-east-1  (optional, defaults to us-east-1)
+  #   SMOKE_SG_ID    – security group that allows inbound TCP 8080
+  #   SMOKE_SUBNET_ID – public subnet (auto-assign public IP must be enabled)
+  # ---------------------------------------------------------------
+  smoke-test:
+    name: Smoke Test (EC2 + Playwright)
+    runs-on: ubuntu-latest
+    needs: publish
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    # OIDC requires id-token: write so GitHub can mint the JWT
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
+      EC2_INSTANCE_TYPE: t3.small
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── AWS auth via OIDC (no long-lived keys stored) ───────────
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ── Fetch JFrog creds from Vault (same path as publish job) ─
+      - name: Fetch JFrog credentials from Vault
+        uses: hashicorp/vault-action@v3
+        with:
+          url: ${{ secrets.VAULT_ADDR }}
+          method: approle
+          roleId: ${{ secrets.VAULT_ROLE_ID }}
+          secretId: ${{ secrets.VAULT_SECRET_ID }}
+          secrets: |
+            ${{ env.VAULT_JFROG_PATH }} username | JF_USER ;
+            ${{ env.VAULT_JFROG_PATH }} password | JF_PASSWORD
+
+      # ── Find the JAR we just published ──────────────────────────
+      - name: Resolve latest JAR from JFrog
+        id: jar
+        env:
+          JF_USER: ${{ env.JF_USER }}
+          JF_PASSWORD: ${{ env.JF_PASSWORD }}
+        run: |
+          JAR_NAME=$(curl -fsSL \
+            -u "$JF_USER:$JF_PASSWORD" \
+            -X POST \
+            "http://18.207.100.83:8082/artifactory/api/search/aql" \
+            -H "Content-Type: text/plain" \
+            -d 'items.find({"repo":{"$eq":"devops-project"},"name":{"$match":"*.jar"}}).sort({"$desc":["created"]}).limit(1)' \
+            | python3 -c "
+          import sys, json
+          results = json.load(sys.stdin).get('results', [])
+          if not results:
+              raise SystemExit('No JAR found in devops-project repository')
+          print(results[0]['name'])
+          ")
+          echo "jar_name=${JAR_NAME}" >> $GITHUB_OUTPUT
+          echo "Resolved JAR: ${JAR_NAME}"
+
+      # ── Look up the freshest Amazon Linux 2023 AMI ──────────────
+      - name: Resolve latest Amazon Linux 2023 AMI
+        id: ami
+        run: |
+          AMI_ID=$(aws ec2 describe-images \
+            --owners amazon \
+            --filters \
+              "Name=name,Values=al2023-ami-2023*-x86_64" \
+              "Name=state,Values=available" \
+            --query 'reverse(sort_by(Images, &CreationDate))[0].ImageId' \
+            --output text)
+          echo "ami_id=${AMI_ID}" >> $GITHUB_OUTPUT
+          echo "Using AMI: ${AMI_ID}"
+
+      # ── Build user-data bootstrap script ────────────────────────
+      # Unquoted heredoc: runner expands $JF_USER / $JF_PASSWORD /
+      # $JAR_NAME now; \$! is escaped so it expands later on EC2.
+      - name: Write EC2 bootstrap user-data script
+        env:
+          JF_USER: ${{ env.JF_USER }}
+          JF_PASSWORD: ${{ env.JF_PASSWORD }}
+          JAR_NAME: ${{ steps.jar.outputs.jar_name }}
+        run: |
+          cat > /tmp/bootstrap.sh << ENDSCRIPT
+          #!/bin/bash
+          set -eux
+          exec > /var/log/petclinic-boot.log 2>&1
+
+          # Install Java 21 (Amazon Linux 2023 ships dnf)
+          dnf install -y java-21-amazon-corretto-headless
+
+          # Download the JAR from JFrog Artifactory
+          mkdir -p /opt/petclinic
+          curl -fsSL \
+            -u "${JF_USER}:${JF_PASSWORD}" \
+            "http://18.207.100.83:8082/artifactory/${{ env.JFROG_REPO }}/${JAR_NAME}" \
+            -o /opt/petclinic/app.jar
+
+          # Launch Spring PetClinic in the background
+          nohup java -jar /opt/petclinic/app.jar \
+            --server.port=8080 \
+            > /var/log/petclinic.log 2>&1 &
+          echo \$! > /var/run/petclinic.pid
+          echo "PetClinic started (PID \$(cat /var/run/petclinic.pid))"
+          ENDSCRIPT
+          echo "Bootstrap script written ($(wc -c < /tmp/bootstrap.sh) bytes)"
+
+      # ── Launch the instance ──────────────────────────────────────
+      - name: Launch EC2 instance
+        id: ec2
+        run: |
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id "${{ steps.ami.outputs.ami_id }}" \
+            --instance-type "${{ env.EC2_INSTANCE_TYPE }}" \
+            --security-group-ids "${{ secrets.SMOKE_SG_ID }}" \
+            --subnet-id "${{ secrets.SMOKE_SUBNET_ID }}" \
+            --associate-public-ip-address \
+            --user-data "file:///tmp/bootstrap.sh" \
+            --metadata-options "HttpTokens=required,HttpEndpoint=enabled" \
+            --tag-specifications \
+              "ResourceType=instance,Tags=[{Key=Name,Value=petclinic-smoke-ci},{Key=RunId,Value=${{ github.run_id }}},{Key=ManagedBy,Value=github-actions}]" \
+            --query 'Instances[0].InstanceId' \
+            --output text)
+          echo "instance_id=${INSTANCE_ID}" >> $GITHUB_OUTPUT
+          echo "Launched: ${INSTANCE_ID}"
+
+      - name: Wait for instance running and capture public IP
+        id: ec2-ip
+        run: |
+          aws ec2 wait instance-running \
+            --instance-ids "${{ steps.ec2.outputs.instance_id }}"
+          PUBLIC_IP=$(aws ec2 describe-instances \
+            --instance-ids "${{ steps.ec2.outputs.instance_id }}" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' \
+            --output text)
+          echo "public_ip=${PUBLIC_IP}" >> $GITHUB_OUTPUT
+          echo "APP_URL=http://${PUBLIC_IP}:8080" >> $GITHUB_ENV
+          echo "Instance running at ${PUBLIC_IP}"
+
+      # ── Poll until the app answers (user-data needs time to run) ─
+      - name: Wait for PetClinic to become healthy (up to 6 min)
+        run: |
+          echo "Polling $APP_URL ..."
+          for i in $(seq 1 72); do
+            HTTP_CODE=$(curl -o /dev/null -s -w "%{http_code}" \
+              --max-time 5 "$APP_URL" || true)
+            if [[ "$HTTP_CODE" =~ ^(200|301|302)$ ]]; then
+              echo "App is UP (HTTP ${HTTP_CODE}) after ~$((i * 5))s"
+              exit 0
+            fi
+            echo "[${i}/72] HTTP ${HTTP_CODE} – waiting 5s..."
+            sleep 5
+          done
+          echo "::error::PetClinic did not become healthy within 6 minutes"
+          exit 1
+
+      # ── Playwright smoke tests ───────────────────────────────────
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Playwright and test dependencies
+        run: |
+          pip install --quiet \
+            playwright \
+            pytest \
+            pytest-playwright \
+            pytest-timeout
+          playwright install chromium --with-deps
+
+      - name: Run Playwright smoke tests (5-minute window)
+        run: |
+          python -m pytest .github/tests/smoke_test.py \
+            -v \
+            --tb=short \
+            --timeout=420 \
+            --screenshot=only-on-failure \
+            --video=retain-on-failure \
+            --output=playwright-results
+        env:
+          APP_URL: ${{ env.APP_URL }}
+
+      # ── Artifacts ────────────────────────────────────────────────
+      - name: Upload smoke test results and browser artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-test-results
+          path: playwright-results/
+          if-no-files-found: ignore
+
+      # ── Always clean up the EC2 instance ────────────────────────
+      - name: Terminate EC2 instance
+        if: always()
+        run: |
+          INSTANCE_ID="${{ steps.ec2.outputs.instance_id }}"
+          if [[ -n "$INSTANCE_ID" ]]; then
+            aws ec2 terminate-instances --instance-ids "$INSTANCE_ID"
+            echo "Terminated: $INSTANCE_ID"
+          else
+            echo "No instance to terminate (launch step may have failed)"
+          fi
+

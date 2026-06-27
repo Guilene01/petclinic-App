@@ -268,16 +268,14 @@ jobs:
         run: |
           JAR_NAME=$(curl -fsSL \
             -u "$JF_USER:$JF_PASSWORD" \
-            -X POST \
-            "http://18.207.100.83:8082/artifactory/api/search/aql" \
-            -H "Content-Type: text/plain" \
-            -d 'items.find({"repo":{"$eq":"devops-project"},"name":{"$match":"*.jar"}}).sort({"$desc":["created"]}).limit(1)' \
+            "http://18.207.100.83:8082/artifactory/api/storage/${{ env.JFROG_REPO }}/target/" \
             | python3 -c "
           import sys, json
-          results = json.load(sys.stdin).get('results', [])
-          if not results:
-              raise SystemExit('No JAR found in devops-project repository')
-          print(results[0]['name'])
+          data = json.load(sys.stdin)
+          jars = [c['uri'].lstrip('/') for c in data.get('children', []) if c['uri'].endswith('.jar')]
+          if not jars:
+              raise SystemExit('No JAR found in devops-project/target/')
+          print(sorted(jars)[-1])
           ")
           echo "jar_name=${JAR_NAME}" >> $GITHUB_OUTPUT
           echo "Resolved JAR: ${JAR_NAME}"
@@ -317,7 +315,7 @@ jobs:
           mkdir -p /opt/petclinic
           curl -fsSL \
             -u "${JF_USER}:${JF_PASSWORD}" \
-            "http://18.207.100.83:8082/artifactory/${{ env.JFROG_REPO }}/${JAR_NAME}" \
+            "http://18.207.100.83:8082/artifactory/${{ env.JFROG_REPO }}/target/${JAR_NAME}" \
             -o /opt/petclinic/app.jar
 
           # Launch Spring PetClinic in the background

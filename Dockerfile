@@ -1,6 +1,6 @@
-FROM eclipse-temurin:17-jdk-alpine
+FROM eclipse-temurin:17-jdk 
 
-RUN addgroup -S petclinic && adduser -S petclinic -G petclinic
+RUN groupadd -r petclinic && useradd -r -g petclinic petclinic
 
 WORKDIR /app
 
